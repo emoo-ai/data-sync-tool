@@ -334,6 +334,7 @@ pub fn run() {
                 }
             }
             // macOS：点 Dock 图标重新激活已运行的应用 → 唤起主窗口（hide 后才能再唤起）
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
             _ => {}
         });
