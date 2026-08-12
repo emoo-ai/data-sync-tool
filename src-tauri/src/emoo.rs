@@ -140,7 +140,8 @@ pub struct DocPermissionAudience {
     pub group_ids: Vec<i64>,
 }
 
-/// 任务级权限设置。仅暴露「可见 / 可删除」两个维度（Emoo 端不支持可编辑参数）。
+/// 任务级权限设置。仅暴露「可见 / 可删除」两个维度；
+/// editable 由工具以安全默认（仅创建者/超管）下发，不在界面暴露。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionSetting {
     pub visible: DocPermissionAudience,
@@ -307,10 +308,19 @@ impl EmooClient {
         #[derive(Serialize)]
         struct Req<'a> {
             visible: &'a DocPermissionAudience,
+            editable: &'a DocPermissionAudience,
             deletable: &'a DocPermissionAudience,
         }
+        // Emoo 服务端校验要求 editable 必填；本工具不暴露该维度，
+        // 统一发安全默认（仅创建者/超管可编辑，空数组）。
+        let editable_default = DocPermissionAudience {
+            perm_type: "none".to_string(),
+            user_open_ids: vec![],
+            group_ids: vec![],
+        };
         let body = Req {
             visible: &setting.visible,
+            editable: &editable_default,
             deletable: &setting.deletable,
         };
         let mut req = self
