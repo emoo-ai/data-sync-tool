@@ -15,8 +15,9 @@ pub const STATUS_ERROR: &str = "error";
 /// 文件夹任务的顶层白名单文件硬上限（超出 → 报错，绝不部分同步）。
 pub const FOLDER_FILE_CAP: usize = 20;
 
-/// 同步调度间隔下限（秒）。
-pub const SCHEDULE_MIN_INTERVAL: i64 = 60;
+/// 同步调度间隔下限（秒）= 1 小时。
+/// UI 以「小时」为单位输入（最低 1），后端换算成秒存储，调度器仍按秒工作。
+pub const SCHEDULE_MIN_INTERVAL: i64 = 3600;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -41,7 +42,7 @@ pub struct Task {
 fn normalize_interval(v: Option<i64>) -> i64 {
     match v {
         Some(x) => x.max(SCHEDULE_MIN_INTERVAL),
-        None => 600,
+        None => 3600,
     }
 }
 
