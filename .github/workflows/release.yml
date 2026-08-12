@@ -58,8 +58,8 @@ jobs:
         # 如需签名/公证，在此处 env 引用仓库 secrets：
         #   macOS 公证: APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
         #   Windows 代码签名: 把证书与密码配置后通过 tauri 的 signing 机制注入
-        env:
-          CI: ''
+        # 注意：不要把 CI 设成空串——tauri CLI 的 --ci 取值 true|false 会读 CI 环境变量，
+        # 空值会被 clap 判为非法（"a value is required for '--ci'"）。GitHub 默认 CI=true 正合适。
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
