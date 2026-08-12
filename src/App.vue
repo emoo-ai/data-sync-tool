@@ -12,6 +12,8 @@ const emooUserId = ref("");
 
 // 开机自启（状态由系统 launchd/注册表持久化，启动时读真实状态）
 const autostartOn = ref(false);
+// 关闭窗口(×)：隐藏到托盘 or 退出（持久化在 config.json）
+const closeToTray = ref(true);
 
 // 鉴权门禁
 const authed = ref(false);
@@ -217,6 +219,16 @@ const taskFiles = reactive<Record<number, FileRecord[]>>({});
 const globalLogs = ref<LogEntry[]>([]);
 const drawerOpen = ref(false);
 
+// 操作即时反馈 toast（点「立即同步」等操作后短暂浮现）
+const toast = ref<{ msg: string; kind: "sync" | "done" | "error" } | null>(null);
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+function flashToast(msg: string, kind: "sync" | "done" | "error" = "sync") {
+  toast.value = { msg, kind };
+  clearTimeout(toastTimer);
+  // 「开始」只是即时确认，闪一下就走；完成/失败停留略久
+  toastTimer = setTimeout(() => (toast.value = null), kind === "sync" ? 1400 : 1800);
+}
+
 function pushLog(e: LogEntry) {
   const arr = taskLogs[e.taskId] ?? (taskLogs[e.taskId] = []);
   arr.unshift(e);
@@ -275,11 +287,14 @@ function errMsg(e: unknown) {
 }
 
 async function syncOne(t: Task) {
+  flashToast(`已开始同步：${t.name}`);
   try {
     await invoke("sync_task_now", { id: t.id });
+    flashToast("同步完成", "done");
   } catch (e) {
     connStatus.value = "同步失败：" + errMsg(e);
     connOk.value = false;
+    flashToast("同步失败", "error");
   } finally {
     await refreshTasks();
     reloadFilesIfOpen(t);
@@ -304,16 +319,23 @@ const schedDraftInterval = reactive<Record<number, number>>({});
 function schedShown(t: Task) {
   return t.scheduleEnabled || !!schedChecked[t.id];
 }
+// 间隔以「小时」为单位输入/展示（最低 1 小时）；后端仍以秒存储。
+const HOUR_SECS = 3600;
+function hoursFromSecs(secs: number) {
+  return Math.max(1, Math.round((secs || HOUR_SECS) / HOUR_SECS));
+}
 function intervalDisplay(t: Task) {
-  return t.scheduleEnabled
-    ? t.scheduleIntervalSecs
-    : schedDraftInterval[t.id] ?? t.scheduleIntervalSecs ?? 600;
+  // 草稿态优先用用户刚输入的小时数；运行态由后端秒数换算。
+  if (!t.scheduleEnabled && schedDraftInterval[t.id] != null) {
+    return schedDraftInterval[t.id];
+  }
+  return hoursFromSecs(t.scheduleIntervalSecs);
 }
 function onSchedCheck(t: Task, e: Event) {
   const checked = (e.target as HTMLInputElement).checked;
   schedChecked[t.id] = checked;
   if (checked && schedDraftInterval[t.id] == null) {
-    schedDraftInterval[t.id] = Math.max(60, t.scheduleIntervalSecs || 600);
+    schedDraftInterval[t.id] = hoursFromSecs(t.scheduleIntervalSecs);
   }
   // 已在运行时取消勾选 → 停止定时
   if (!checked && t.scheduleEnabled) {
@@ -321,16 +343,16 @@ function onSchedCheck(t: Task, e: Event) {
   }
 }
 function onIntervalChange(t: Task, e: Event) {
-  const v = Math.max(60, Number((e.target as HTMLInputElement).value) || 60);
+  const hours = Math.max(1, Number((e.target as HTMLInputElement).value) || 1);
   if (t.scheduleEnabled) {
-    void patchTask(t, { scheduleIntervalSecs: v });
+    void patchTask(t, { scheduleIntervalSecs: hours * HOUR_SECS });
   } else {
-    schedDraftInterval[t.id] = v;
+    schedDraftInterval[t.id] = hours;
   }
 }
 async function startSchedule(t: Task) {
-  const interval = schedDraftInterval[t.id] ?? t.scheduleIntervalSecs ?? 600;
-  await patchTask(t, { scheduleEnabled: true, scheduleIntervalSecs: interval });
+  const hours = schedDraftInterval[t.id] ?? hoursFromSecs(t.scheduleIntervalSecs);
+  await patchTask(t, { scheduleEnabled: true, scheduleIntervalSecs: hours * HOUR_SECS });
   schedChecked[t.id] = false; // 已开启，回到「运行中」展示态
 }
 async function stopSchedule(t: Task) {
@@ -398,7 +420,7 @@ const newName = ref("");
 const newPath = ref("");
 const newIsDir = ref(false);
 const newSched = ref(false);
-const newInterval = ref(600);
+const newInterval = ref(1);
 const folderCount = ref<number | null>(null);
 const folderError = ref("");
 const formError = ref("");
@@ -411,7 +433,7 @@ function openNew() {
     newPath.value = "";
     newIsDir.value = false;
     newSched.value = false;
-    newInterval.value = 600;
+    newInterval.value = 1;
     folderCount.value = null;
     folderError.value = "";
     formError.value = "";
@@ -482,7 +504,7 @@ async function createTask() {
         isDir: newIsDir.value,
         targetFolderId: selectedFolderId.value,
         scheduleEnabled: newSched.value,
-        scheduleIntervalSecs: newSched.value ? Number(newInterval.value) || 600 : undefined,
+        scheduleIntervalSecs: newSched.value ? (Number(newInterval.value) || 1) * HOUR_SECS : undefined,
       },
     });
     showNew.value = false;
@@ -596,11 +618,24 @@ async function toggleAutostart(e: Event) {
   }
 }
 
+// 关闭到托盘：即时写入 config.json。
+async function toggleCloseToTray(e: Event) {
+  const checked = (e.target as HTMLInputElement).checked;
+  try {
+    await invoke("set_close_behavior", { closeToTray: checked });
+    closeToTray.value = checked;
+  } catch (err) {
+    closeToTray.value = !checked; // 复选框回滚
+    await message("设置关闭行为失败：" + errMsg(err), { title: "失败", kind: "error" });
+  }
+}
+
 onMounted(async () => {
   window.addEventListener("resize", onWinResize);
   void loadAutostart();
   try {
-    const cfg = await invoke<{ base_url: string; api_key: string; emoo_user_id: string | null }>("load_config");
+    const cfg = await invoke<{ base_url: string; api_key: string; emoo_user_id: string | null; close_to_tray: boolean }>("load_config");
+    closeToTray.value = cfg.close_to_tray !== false; // 缺省视为 true
     if (cfg.base_url) baseUrl.value = cfg.base_url;
     if (cfg.emoo_user_id) emooUserId.value = cfg.emoo_user_id;
     if (cfg.api_key) {
@@ -798,7 +833,11 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
         <input type="checkbox" :checked="autostartOn" @change="toggleAutostart" />
         <span>开机自启</span>
       </label>
-      <button v-if="authed" class="link" @click="logout">退出</button>
+      <label class="sw top-sw" title="关闭窗口时最小化到托盘，后台继续同步">
+        <input type="checkbox" :checked="closeToTray" @change="toggleCloseToTray" />
+        <span>关闭到托盘</span>
+      </label>
+      <button v-if="authed" class="link" @click="logout">切换</button>
     </header>
 
     <!-- 鉴权门禁 -->
@@ -811,12 +850,12 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
       <label>API Key（emoo_ 开头，绑用户）
         <input v-model="apiKey" type="password" placeholder="emoo_xxxxxxxx" />
       </label>
-      <label>调用者 open_id（设置文档权限用，可留空）
+      <label>工作区超管 open_id（设置文档权限用）
         <div class="row-input">
-          <input v-model="emooUserId" placeholder="ou_xxxxxxxx（你的 open_id）" />
+          <input v-model="emooUserId" placeholder="ou_xxxxxxxx（超管账号的 open_id）" />
           <button class="sm" type="button" @click="pickCaller">从通讯录选择</button>
         </div>
-        <span class="muted small">仅在「设置文档权限」时作为 Emoo-User-Id 请求头；该接口需工作区超管权限。</span>
+        <span class="muted small">设置文档权限时作为 Emoo-User-Id 请求头，必须是工作区超管——即本 API Key 绑定的账号本人。不用文档权限功能可不填。</span>
       </label>
       <div class="actions">
         <button class="primary" :disabled="saving" @click="saveAndTest">
@@ -904,8 +943,8 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
           <label class="sw">
             <input type="checkbox" v-model="newSched" />
             <span>启用定时同步</span>
-            <input v-if="newSched" class="intv" type="number" min="60" step="60" v-model.number="newInterval" />
-            <span v-if="newSched" class="muted">秒（最少 60）</span>
+            <input v-if="newSched" class="intv" type="number" min="1" step="1" v-model.number="newInterval" />
+            <span v-if="newSched" class="muted">小时</span>
           </label>
         </div>
 
@@ -971,12 +1010,12 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
               <input
                 class="intv"
                 type="number"
-                min="60"
-                step="60"
+                min="1"
+                step="1"
                 :value="intervalDisplay(t)"
                 @change="onIntervalChange(t, $event)"
               />
-              <span class="muted small">秒</span>
+              <span class="muted small">小时</span>
               <button v-if="!t.scheduleEnabled" class="sm" @click="startSchedule(t)">开启同步</button>
               <button v-else class="sm" @click="stopSchedule(t)">停止同步</button>
             </span>
@@ -1079,7 +1118,7 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
                 </span>
               </div>
             </div>
-            <p v-if="!emooUserId" class="msg warn small">未设置「调用者 open_id」，权限接口可能被拒（请在鉴权配置填写你的 open_id，且账号需为工作区超管）。</p>
+            <p v-if="!emooUserId" class="msg warn small">未设置「工作区超管 open_id」，权限接口会被拒——请在鉴权配置填写超管账号（即本 API Key 绑定账号）的 open_id。</p>
           </div>
         </div>
         <div class="modal-ft">
@@ -1126,6 +1165,22 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
         </div>
       </div>
     </div>
+
+    <!-- 操作即时反馈 toast -->
+    <Transition name="toast">
+      <div v-if="toast" class="toast" :class="toast.kind" role="status">
+        <svg v-if="toast.kind === 'done'" class="toast-ic" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z" />
+        </svg>
+        <svg v-else-if="toast.kind === 'error'" class="toast-ic" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z" />
+        </svg>
+        <svg v-else class="toast-ic spin" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" />
+        </svg>
+        <span>{{ toast.msg }}</span>
+      </div>
+    </Transition>
   </main>
 </template>
 
@@ -1810,6 +1865,55 @@ button.danger:hover:not(:disabled) {
 }
 .un {
   font-weight: 500;
+}
+
+/* 操作即时反馈 toast */
+.toast {
+  position: fixed;
+  left: 50%;
+  top: 28px;
+  transform: translateX(-50%);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  pointer-events: none;
+}
+.toast-ic {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+  flex: none;
+}
+.toast-ic.spin {
+  animation: tspin 0.9s linear infinite;
+}
+.toast.done {
+  color: #2ea043;
+}
+.toast.error {
+  color: #f85149;
+}
+@keyframes tspin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -10px);
 }
 </style>
 

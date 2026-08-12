@@ -4,7 +4,8 @@ use crate::emoo::EmooClient;
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use tauri::AppHandle;
 
 pub struct AppState {
@@ -22,19 +23,15 @@ pub struct AppState {
 impl AppState {
     /// 尝试占用任务同步槽；已被占用返回 false（跳过本次触发）。
     pub fn try_acquire(&self, task_id: i64) -> bool {
-        if let Ok(mut g) = self.inflight.lock() {
-            if g.contains(&task_id) {
-                return false;
-            }
-            g.insert(task_id);
-            return true;
+        let mut g = self.inflight.lock();
+        if g.contains(&task_id) {
+            return false;
         }
-        false
+        g.insert(task_id);
+        true
     }
 
     pub fn release(&self, task_id: i64) {
-        if let Ok(mut g) = self.inflight.lock() {
-            g.remove(&task_id);
-        }
+        self.inflight.lock().remove(&task_id);
     }
 }

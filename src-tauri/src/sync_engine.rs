@@ -75,19 +75,13 @@ pub async fn sync_task(
 
     // 取任务
     let task = {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::get_task(&g, task_id)?
     }
     .ok_or_else(|| anyhow!("任务不存在 #{task_id}"))?;
 
     // 起手 clone 客户端（廉价：reqwest::Client 是 Arc），锁只在此瞬间持有
-    let client = {
-        state
-            .emoo
-            .read()
-            .expect("emoo lock")
-            .clone()
-    };
+    let client = state.emoo.read().clone();
 
     set_status(app, state, task_id, STATUS_SYNCING, "");
 
@@ -157,13 +151,13 @@ pub async fn sync_task(
 
         // 本地删除扫描：DB 里 synced 但磁盘已无 → 标 source_deleted，远端文档保留
         let recs = {
-            let g = state.db.lock().unwrap();
+            let g = state.db.lock();
             db::list_file_records(&g, task_id)?
         };
         for r in recs {
             if r.status == "synced" && !on_disk.contains(&r.relative_path) {
                 {
-                    let g = state.db.lock().unwrap();
+                    let g = state.db.lock();
                     let _ = db::mark_file_source_deleted(&g, task_id, &r.relative_path);
                 }
                 outcome.source_deleted += 1;
@@ -203,7 +197,7 @@ pub async fn sync_task(
     // 成功收尾
     let now = now_secs();
     {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         let _ = db::touch_task_synced(&g, task_id, now);
     }
     set_status(app, state, task_id, STATUS_IDLE, "");
@@ -254,7 +248,7 @@ async fn sync_one_file(
         .unwrap_or(0);
 
     let prior = {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::get_file_record(&g, task_id, rel)?
     };
 
@@ -330,7 +324,7 @@ async fn decide_action(
                 status: "synced".to_string(),
             };
             {
-                let g = state.db.lock().unwrap();
+                let g = state.db.lock();
                 db::upsert_file_record(&g, &rec)?;
             }
             if p.status == "source_deleted" {
@@ -385,7 +379,7 @@ async fn decide_action(
         status: "synced".to_string(),
     };
     {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::upsert_file_record(&g, &rec)?;
     }
 
@@ -446,11 +440,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn set_status(app: &AppHandle, state: &Arc<AppState>, task_id: i64, status: &str, msg: &str) {
     {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         let _ = db::set_task_status(&g, task_id, status, if msg.is_empty() { None } else { Some(msg) });
     }
     let last = {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::get_task(&g, task_id)
             .ok()
             .flatten()
@@ -489,7 +483,7 @@ fn emit_log(
     detail: &str,
 ) {
     let ts = {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::append_log(&g, task_id, level, msg, detail).unwrap_or_else(|_| now_secs())
     };
     let _ = app.emit(

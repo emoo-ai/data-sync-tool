@@ -15,9 +15,12 @@ use crate::emoo::EmooClient;
 use crate::state::AppState;
 use crate::task::{NewTask, Task, TaskPatch};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 
 // ---------------- 鉴权 / 配置（M1 保留） ----------------
 
@@ -62,17 +65,21 @@ fn save_config(
     )
     .map_err(|e| e.to_string())?;
     // 写完 config 立即让已建好的 EmooClient 换上新的 base/key/user_id（复用 reqwest 连接池）
-    if let Ok(mut c) = state.emoo.write() {
-        c.reconfigure(base_url, api_key, emoo_user_id);
-    }
+    let mut c = state.emoo.write();
+    c.reconfigure(base_url, api_key, emoo_user_id);
     Ok(())
+}
+
+#[tauri::command]
+fn set_close_behavior(app: tauri::AppHandle, close_to_tray: bool) -> Result<(), String> {
+    config::set_close_behavior(&app, close_to_tray).map_err(|e| e.to_string())
 }
 
 // ---------------- 任务管理 ----------------
 
 #[tauri::command]
 fn list_tasks(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Task>, String> {
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::list_tasks(&g).map_err(|e| e.to_string())
 }
 
@@ -90,7 +97,7 @@ fn create_task(state: tauri::State<'_, Arc<AppState>>, new: NewTask) -> Result<T
             }
         }
     }
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::insert_task(&g, &new).map_err(|e| e.to_string())
 }
 
@@ -100,7 +107,7 @@ fn update_task(
     id: i64,
     patch: TaskPatch,
 ) -> Result<Task, String> {
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::update_task(&g, id, &patch).map_err(|e| e.to_string())
 }
 
@@ -108,12 +115,12 @@ fn update_task(
 fn delete_task(state: tauri::State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     // 同步中拒绝删除
     {
-        let g = state.inflight.lock().unwrap();
+        let g = state.inflight.lock();
         if g.contains(&id) {
             return Err("任务正在同步，请稍后再试".to_string());
         }
     }
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::delete_task(&g, id).map_err(|e| e.to_string())
 }
 
@@ -134,7 +141,7 @@ async fn sync_task_now(
 async fn sync_all(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     let state = state.inner().clone();
     let tasks = {
-        let g = state.db.lock().unwrap();
+        let g = state.db.lock();
         db::list_tasks(&g).map_err(|e| e.to_string())?
     };
     for t in tasks {
@@ -154,7 +161,7 @@ fn list_log(
     task_id: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<task::LogEntry>, String> {
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::recent_log(&g, task_id, limit.unwrap_or(200)).map_err(|e| e.to_string())
 }
 
@@ -163,7 +170,7 @@ fn list_file_records(
     state: tauri::State<'_, Arc<AppState>>,
     task_id: i64,
 ) -> Result<Vec<task::FileRecord>, String> {
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::list_file_records(&g, task_id).map_err(|e| e.to_string())
 }
 
@@ -182,7 +189,7 @@ async fn list_ws_users(
     current_page: Option<i64>,
     page_size: Option<i64>,
 ) -> Result<Vec<emoo::WsUser>, String> {
-    let client = state.emoo.read().expect("emoo lock").clone();
+    let client = state.emoo.read().clone();
     client
         .list_ws_users(keyword.as_deref(), page_size, current_page)
         .await
@@ -196,7 +203,7 @@ fn set_task_permission(
     id: i64,
     permission: Option<task::PermissionSetting>,
 ) -> Result<task::Task, String> {
-    let g = state.db.lock().unwrap();
+    let g = state.db.lock();
     db::set_task_permission(&g, id, &permission).map_err(|e| e.to_string())
 }
 
@@ -217,6 +224,48 @@ fn init_state(app: &tauri::AppHandle) -> Result<Arc<AppState>, Box<dyn std::erro
     }))
 }
 
+// ---------------- 托盘 / 窗口 ----------------
+
+/// 显示并聚焦主窗口（从最小化/隐藏状态唤起）。幂等：重复调用只 show，不会 toggle 抵消。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 构建系统托盘：左键唤起窗口，右键菜单（显示/退出）。
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    TrayIconBuilder::with_id("main-tray")
+        .icon(app.default_window_icon().cloned().unwrap())
+        .tooltip("Emoo 数据同步")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // macOS 上 Click 在按下/松开各触发一次，toggle 会被连点抵消；
+            // 改为「总是唤起」，隐藏交给窗口 ×（关闭到托盘）。
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -227,12 +276,31 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
+            // macOS：纯托盘 app，Dock 不显示图标（Windows/Linux 不受影响）
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let state = init_state(app.handle())?;
             app.manage(state.clone());
             // 定时调度后台线程：每秒查到期任务并同步
             let st = state.clone();
             std::thread::spawn(move || scheduler::scheduler_loop(st));
+            // 系统托盘（左键切换窗口，右键菜单显示/退出）
+            build_tray(app.handle())?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关闭(×)按 config.close_to_tray 决定：true=隐藏到托盘，false=放行退出
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let hide = config::load(window.app_handle())
+                        .map(|c| c.close_to_tray)
+                        .unwrap_or(true);
+                    if hide {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // 鉴权 / 配置
@@ -254,14 +322,19 @@ pub fn run() {
             // 通讯录 / 文档权限
             list_ws_users,
             set_task_permission,
+            // 托盘偏好
+            set_close_behavior,
         ])
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::Exit => {
                 if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
                     state.shutdown.store(true, Ordering::SeqCst);
                 }
             }
+            // macOS：点 Dock 图标重新激活已运行的应用 → 唤起主窗口（hide 后才能再唤起）
+            tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
+            _ => {}
         });
 }

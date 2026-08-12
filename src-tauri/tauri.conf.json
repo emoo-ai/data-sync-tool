@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Emoo 数据同步工具",
         "width": 720,
         "height": 520,

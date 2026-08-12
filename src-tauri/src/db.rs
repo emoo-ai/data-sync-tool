@@ -32,7 +32,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
              is_dir INTEGER NOT NULL DEFAULT 0,
              target_folder_id INTEGER,
              schedule_enabled INTEGER NOT NULL DEFAULT 0,
-             schedule_interval_secs INTEGER NOT NULL DEFAULT 600,
+             schedule_interval_secs INTEGER NOT NULL DEFAULT 3600,
              status TEXT NOT NULL DEFAULT 'idle',
              status_message TEXT NOT NULL DEFAULT '',
              last_synced_at INTEGER,
@@ -374,6 +374,14 @@ pub fn recent_log(conn: &Connection, task_id: Option<i64>, limit: i64) -> Result
     }
 }
 
+/// 删除 ts 早于 now - retain_secs 的日志，并收缩 WAL，避免长期运行累积膨胀。返回删除行数。
+pub fn cleanup_old_logs(conn: &Connection, now: i64, retain_secs: i64) -> Result<usize> {
+    let cutoff = now - retain_secs;
+    let n = conn.execute("DELETE FROM sync_log WHERE ts < ?1", params![cutoff])?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,7 +409,7 @@ mod tests {
         let t = insert_task(&c, &sample_new("a", "/x", false)).unwrap();
         assert_eq!(t.name, "a");
         assert!(!t.is_dir);
-        assert_eq!(t.schedule_interval_secs, 600);
+        assert_eq!(t.schedule_interval_secs, 3600);
         let got = get_task(&c, t.id).unwrap().unwrap();
         assert_eq!(got.id, t.id);
         assert_eq!(list_tasks(&c).unwrap().len(), 1);
@@ -448,9 +456,26 @@ mod tests {
     }
 
     #[test]
-    fn interval_floors_to_60() {
+    fn interval_floors_to_1_hour() {
         let mut n = sample_new("a", "/x", false);
         n.schedule_interval_secs = Some(10);
-        assert_eq!(n.interval(), 60);
+        assert_eq!(n.interval(), 3600);
+    }
+
+    #[test]
+    fn cleanup_old_logs_deletes_by_ts() {
+        let c = mem();
+        let t = insert_task(&c, &sample_new("a", "/x", false)).unwrap();
+        // append_log 用当前时间，无法直接造老数据；手动插一条 ts=1000 的老日志。
+        c.execute(
+            "INSERT INTO sync_log (task_id, ts, level, message, detail) \
+             VALUES (?1, 1000, 'info', 'old', '')",
+            params![t.id],
+        )
+        .unwrap();
+        let now = 1_000_000_000_i64;
+        let n = cleanup_old_logs(&c, now, 100).unwrap(); // cutoff = now-100 → 删 ts<now-100
+        assert_eq!(n, 1);
+        assert_eq!(recent_log(&c, Some(t.id), 10).unwrap().len(), 0);
     }
 }
