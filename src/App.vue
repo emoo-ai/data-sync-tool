@@ -670,7 +670,11 @@ onBeforeUnmount(() => {
 });
 
 // 鉴权切换需要重新居中；新建表单开合 / 任务增删只调高度、保持窗口位置
-watch(authed, () => scheduleFit(true));
+watch(authed, (v) => {
+  scheduleFit(true);
+  // 进入同步页：全局 client 已就绪，预载通讯录以解析连接条上的超管姓名（静默失败）
+  if (v) void loadWsUsers("", true);
+});
 watch(showNew, () => scheduleFit(false));
 watch(() => tasks.value.length, () => scheduleFit(false));
 
@@ -719,8 +723,14 @@ const userName = computed(() => {
   for (const u of wsUsers.value) m[u.open_id] = u.ws_username;
   return m;
 });
+// 连接条展示的超管姓名：从已预载的通讯录解析；未命中时退化为 open_id 片段。
+const callerLabel = computed(() => {
+  const id = emooUserId.value;
+  if (!id) return "";
+  return userName.value[id] ?? id.slice(0, 12);
+});
 
-async function loadWsUsers(kw: string) {
+async function loadWsUsers(kw: string, silent = false) {
   wsLoading.value = true;
   try {
     wsUsers.value = await invoke<WsUser[]>("list_ws_users", {
@@ -730,8 +740,11 @@ async function loadWsUsers(kw: string) {
     });
   } catch (e) {
     wsUsers.value = [];
-    connStatus.value = "通讯录加载失败：" + errMsg(e);
-    connOk.value = false;
+    // 静默模式（如进入同步页预载）失败不污染连接状态条
+    if (!silent) {
+      connStatus.value = "通讯录加载失败：" + errMsg(e);
+      connOk.value = false;
+    }
   } finally {
     wsLoading.value = false;
   }
@@ -768,7 +781,15 @@ function cancelPicker() {
 }
 async function pickCaller() {
   const sel = await openPicker(false, emooUserId.value ? [emooUserId.value] : []);
-  if (sel && sel.length) emooUserId.value = sel[0];
+  if (sel && sel.length) {
+    emooUserId.value = sel[0];
+    try {
+      await invoke("set_emoo_user_id", { emooUserId: emooUserId.value });
+    } catch (e) {
+      connStatus.value = "保存超管失败：" + errMsg(e);
+      connOk.value = false;
+    }
+  }
 }
 
 // 任务权限编辑
@@ -850,13 +871,6 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
       <label>API Key（emoo_ 开头，绑用户）
         <input v-model="apiKey" type="password" placeholder="emoo_xxxxxxxx" />
       </label>
-      <label>工作区超管 open_id（设置文档权限用）
-        <div class="row-input">
-          <input v-model="emooUserId" placeholder="ou_xxxxxxxx（超管账号的 open_id）" />
-          <button class="sm" type="button" @click="pickCaller">从通讯录选择</button>
-        </div>
-        <span class="muted small">设置文档权限时作为 Emoo-User-Id 请求头，必须是工作区超管——即本 API Key 绑定的账号本人。不用文档权限功能可不填。</span>
-      </label>
       <div class="actions">
         <button class="primary" :disabled="saving" @click="saveAndTest">
           <span v-if="saving" class="spinner"></span>
@@ -871,6 +885,14 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
       <div class="bar">
         <span class="live"></span>已连接 {{ baseUrl
         }}<span class="muted"> · {{ maskedKey }}</span>
+        <span class="spacer"></span>
+        <button
+          class="link caller"
+          @click="pickCaller"
+          :title="emooUserId ? '更换工作区超管（设置文档权限用）' : '选择工作区超管（设置文档权限用）'"
+        >
+          {{ emooUserId ? "超管 · " + callerLabel : "+ 选择超管" }}
+        </button>
       </div>
 
       <div class="toolbar">
@@ -1118,7 +1140,7 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
                 </span>
               </div>
             </div>
-            <p v-if="!emooUserId" class="msg warn small">未设置「工作区超管 open_id」，权限接口会被拒——请在鉴权配置填写超管账号（即本 API Key 绑定账号）的 open_id。</p>
+            <p v-if="!emooUserId" class="msg warn small">未设置工作区超管，权限接口会被拒——请点上方连接栏的「选择超管」选择本 API Key 绑定的超管账号。</p>
           </div>
         </div>
         <div class="modal-ft">
@@ -1135,7 +1157,7 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
     <div v-if="pickerOpen" class="overlay" @click.self="cancelPicker">
       <div class="modal">
         <div class="modal-hd">
-          <span>{{ pickerMulti ? "选择成员" : "选择调用者（自己）" }}</span>
+          <span>{{ pickerMulti ? "选择成员" : "选择工作区超管" }}</span>
           <button class="link sm" @click="cancelPicker">✕</button>
         </div>
         <div class="modal-bd">
@@ -1348,6 +1370,10 @@ button.link {
 }
 button.link:hover {
   color: #9373ee;
+}
+.caller {
+  font-size: 12px;
+  padding: 3px 6px;
 }
 button.danger {
   color: #d73a49;

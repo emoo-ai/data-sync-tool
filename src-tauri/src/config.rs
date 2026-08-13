@@ -82,3 +82,12 @@ pub fn set_close_behavior(app: &tauri::AppHandle, close_to_tray: bool) -> Result
     c.close_to_tray = close_to_tray;
     write(app, &c)
 }
+
+/// 单独设置「工作区超管 open_id」，保留其余字段。返回写回后的完整 Config，
+/// 供调用方据此 reconfigure 已建好的 EmooClient（复用 reqwest 连接池）。
+pub fn set_emoo_user_id(app: &tauri::AppHandle, emoo_user_id: Option<String>) -> Result<Config> {
+    let mut c = load(app).unwrap_or_default();
+    c.emoo_user_id = emoo_user_id.filter(|s| !s.trim().is_empty());
+    write(app, &c)?;
+    Ok(c)
+}

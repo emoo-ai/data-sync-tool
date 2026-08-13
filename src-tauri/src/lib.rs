@@ -75,6 +75,20 @@ fn set_close_behavior(app: tauri::AppHandle, close_to_tray: bool) -> Result<(), 
     config::set_close_behavior(&app, close_to_tray).map_err(|e| e.to_string())
 }
 
+/// 单独更新「工作区超管 open_id」（同步页连接条选择超管用）。
+/// 写 config 后据此 reconfigure 全局 EmooClient，保留现有 base/key。
+#[tauri::command]
+fn set_emoo_user_id(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    emoo_user_id: Option<String>,
+) -> Result<(), String> {
+    let c = config::set_emoo_user_id(&app, emoo_user_id).map_err(|e| e.to_string())?;
+    let mut client = state.emoo.write();
+    client.reconfigure(c.base_url, c.api_key, c.emoo_user_id);
+    Ok(())
+}
+
 // ---------------- 任务管理 ----------------
 
 #[tauri::command]
@@ -324,6 +338,7 @@ pub fn run() {
             set_task_permission,
             // 托盘偏好
             set_close_behavior,
+            set_emoo_user_id,
         ])
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
