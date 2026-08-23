@@ -104,7 +104,7 @@ fn create_task(state: tauri::State<'_, Arc<AppState>>, new: NewTask) -> Result<T
         if let Some(n) = sync_engine::list_syncable_files(std::path::Path::new(&new.local_path)) {
             if n.len() > task::FOLDER_FILE_CAP {
                 return Err(format!(
-                    "文件夹内可同步文件 {} 个，超过 {} 上限",
+                    "文件夹内（含子目录）可同步文件 {} 个，超过 {} 上限",
                     n.len(),
                     task::FOLDER_FILE_CAP
                 ));

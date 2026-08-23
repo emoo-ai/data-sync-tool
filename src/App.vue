@@ -43,6 +43,8 @@ interface Task {
   createdAt: number;
   updatedAt: number;
   permission?: PermissionSetting | null;
+  /** 文件夹任务：是否把本地根文件夹自己也镜像到目标下（同名子文件夹）。 */
+  includeRoot?: boolean;
 }
 interface LogEntry {
   taskId: number;
@@ -82,6 +84,9 @@ interface TaskPatch {
   scheduleEnabled?: boolean;
   scheduleIntervalSecs?: number;
 }
+
+/// 文件夹任务递归文件数上限（含子目录），与后端 task.rs 的 FOLDER_FILE_CAP 保持一致。
+const FOLDER_FILE_CAP = 500;
 
 // ---------- 文件夹树（新建任务表单内复用） ----------
 const rootChildren = ref<FolderNode[]>([]);
@@ -423,6 +428,7 @@ const newSched = ref(false);
 const newInterval = ref(1);
 const folderCount = ref<number | null>(null);
 const folderError = ref("");
+const newIncludeRoot = ref(true);
 const formError = ref("");
 const creating = ref(false);
 
@@ -432,6 +438,7 @@ function openNew() {
     newName.value = "";
     newPath.value = "";
     newIsDir.value = false;
+    newIncludeRoot.value = true;
     newSched.value = false;
     newInterval.value = 1;
     folderCount.value = null;
@@ -453,8 +460,8 @@ async function checkFolderCap() {
     const n = await invoke<number | null>("count_folder_files", { path: newPath.value });
     folderCount.value = n;
     folderError.value =
-      n != null && n > 20
-        ? `文件夹内可同步文件 ${n} 个，超过 20 个上限，请精简或改选`
+      n != null && n > FOLDER_FILE_CAP
+        ? `文件夹内可同步 ${n} 个文件（含子目录），超过 ${FOLDER_FILE_CAP} 个上限，请精简或改选`
         : "";
   } catch {
     folderCount.value = null;
@@ -502,6 +509,7 @@ async function createTask() {
         name: newName.value.trim(),
         localPath: newPath.value,
         isDir: newIsDir.value,
+        includeRoot: newIsDir.value && newIncludeRoot.value,
         targetFolderId: selectedFolderId.value,
         scheduleEnabled: newSched.value,
         scheduleIntervalSecs: newSched.value ? (Number(newInterval.value) || 1) * HOUR_SECS : undefined,
@@ -957,11 +965,15 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
             <button class="sm" @click="pickFile">选文件</button>
             <button class="sm" @click="pickFolder">选文件夹</button>
             <span class="path" :class="{ empty: !newPath }">{{ newPath || "未选择" }}</span>
-            <span v-if="newIsDir && folderCount != null" class="cap">可同步 {{ folderCount }} 个文件</span>
+            <span v-if="newIsDir && folderCount != null" class="cap">可同步 {{ folderCount }} 个文件（含子目录）</span>
           </div>
         </div>
 
         <div class="switches">
+          <label v-if="newIsDir" class="sw">
+            <input type="checkbox" v-model="newIncludeRoot" />
+            <span>包含文件夹本身（在目标下创建同名子文件夹，整体镜像进它）</span>
+          </label>
           <label class="sw">
             <input type="checkbox" v-model="newSched" />
             <span>启用定时同步</span>
@@ -1069,7 +1081,7 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
             <p v-if="!taskFiles[t.id] || !taskFiles[t.id].length" class="muted small">暂无已同步文件</p>
             <div v-for="(f, i) in taskFiles[t.id]" :key="i" class="fline">
               <span class="fstatus" :class="fileStatusMeta(f.status).cls" :title="fileStatusMeta(f.status).text">●</span>
-              <span class="fname">{{ f.relativePath }}</span>
+              <span class="fname" :title="f.relativePath">{{ f.relativePath }}</span>
               <span class="muted small fsz">{{ fmtSize(f.size) }}</span>
               <span class="muted small fkey" :title="f.docKey">{{ f.docKey.slice(0, 14) }}…</span>
             </div>

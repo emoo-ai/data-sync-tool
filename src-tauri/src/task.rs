@@ -12,8 +12,8 @@ pub const STATUS_SYNCING: &str = "syncing";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_ERROR: &str = "error";
 
-/// 文件夹任务的顶层白名单文件硬上限（超出 → 报错，绝不部分同步）。
-pub const FOLDER_FILE_CAP: usize = 20;
+/// 文件夹任务的递归白名单文件硬上限（含子目录；超出 → 报错，绝不部分同步）。
+pub const FOLDER_FILE_CAP: usize = 500;
 
 /// 同步调度间隔下限（秒）= 1 小时。
 /// UI 以「小时」为单位输入（最低 1），后端换算成秒存储，调度器仍按秒工作。
@@ -28,6 +28,10 @@ pub struct Task {
     pub is_dir: bool,
     pub target_folder_id: Option<i64>,
     pub schedule_enabled: bool,
+    /// 文件夹任务：是否把本地根文件夹自己也镜像到目标下（true=在目标下
+    /// find-or-create 同名文件夹再整体镜像；false=内容直接进目标）。老任务默认 false。
+    #[serde(default)]
+    pub include_root: bool,
     pub schedule_interval_secs: i64,
     pub status: String,
     pub status_message: String,
@@ -53,6 +57,9 @@ pub struct NewTask {
     pub local_path: String,
     pub is_dir: bool,
     pub target_folder_id: Option<i64>,
+    /// 是否包含本地根文件夹本身（仅文件夹任务有意义；缺省 false 兼容旧前端）。
+    #[serde(default)]
+    pub include_root: bool,
     #[serde(default)]
     pub schedule_enabled: Option<bool>,
     #[serde(default)]

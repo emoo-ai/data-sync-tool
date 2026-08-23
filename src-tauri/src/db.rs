@@ -71,30 +71,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])?;
     }
 
-    // 增量列：tasks.permission（JSON，可空）。CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，
-    // 老库需要单独 ALTER；用 PRAGMA table_info 判断是否已有该列，保证幂等。
-    let has_perm = {
-        let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
-        let mut rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        let mut found = false;
-        while let Some(Ok(col)) = rows.next() {
-            if col == "permission" {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    if !has_perm {
+    // 增量列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，老库需要单独 ALTER；
+    // 用 PRAGMA table_info 判断是否已有该列，保证幂等。
+    // - tasks.permission（JSON，可空）
+    // - tasks.include_root（0/1，默认 0=老任务保持「内容直接进目标」旧行为）
+    if !has_column(conn, "tasks", "permission")? {
         conn.execute("ALTER TABLE tasks ADD COLUMN permission TEXT", [])?;
+    }
+    if !has_column(conn, "tasks", "include_root")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN include_root INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
 
     Ok(())
 }
 
+fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    let mut found = false;
+    while let Some(Ok(c)) = rows.next() {
+        if c == col {
+            found = true;
+            break;
+        }
+    }
+    Ok(found)
+}
+
 const TASK_COLS: &str = "id, name, local_path, is_dir, target_folder_id, schedule_enabled, \
      schedule_interval_secs, status, status_message, last_synced_at, created_at, updated_at, \
-     permission";
+     permission, include_root";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     let perm_json: Option<String> = r.get(12).unwrap_or(None);
@@ -113,6 +123,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
         permission,
+        include_root: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -172,14 +183,15 @@ pub fn insert_task(conn: &Connection, n: &NewTask) -> Result<Task> {
     let interval = n.interval();
     conn.execute(
         "INSERT INTO tasks \
-         (name, local_path, is_dir, target_folder_id, schedule_enabled, \
+         (name, local_path, is_dir, target_folder_id, include_root, schedule_enabled, \
           schedule_interval_secs, status, status_message, created_at, updated_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,'idle','',?7,?7)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,'idle','',?8,?8)",
         params![
             n.name,
             n.local_path,
             n.is_dir as i64,
             n.target_folder_id,
+            n.include_root as i64,
             n.schedule() as i64,
             interval,
             now
@@ -398,6 +410,7 @@ mod tests {
             local_path: path.to_string(),
             is_dir,
             target_folder_id: Some(5),
+            include_root: false,
             schedule_enabled: Some(false),
             schedule_interval_secs: None,
         }

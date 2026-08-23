@@ -45,6 +45,17 @@ pub struct KbFileDoc {
     pub folder_id: Option<i64>,
 }
 
+/// 远端 folder 信息（POST /data/folder 返回，仅取本工具所需字段）。
+/// 不复用 FolderItem：其判别字段 `type` 无 default，而创建响应没有该字段。
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FolderInfo {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+}
+
 // ---- Emoo 统一响应壳 ----
 #[derive(Deserialize)]
 struct EmooResp<T> {
@@ -229,6 +240,26 @@ impl EmooClient {
         let resp = req.send().await.context("GET /data/folder/items")?;
         let d: FolderItemsData = Self::parse(resp, "folder/items").await?;
         Ok(d.items)
+    }
+
+    /// 创建远端 folder（POST /data/folder）。限工作区超管；同 parent 下名称唯一（≤200 字符）。
+    /// 常见业务错误：4042 非超管 / 4206 同级重名 / 4207 树深超 10 层。
+    pub async fn create_folder(&self, name: &str, parent_id: Option<i64>) -> Result<FolderInfo> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parent_id: Option<i64>,
+        }
+        let resp = self
+            .http
+            .post(self.url("/data/folder"))
+            .bearer_auth(&self.api_key)
+            .json(&Req { name, parent_id })
+            .send()
+            .await
+            .context("POST /data/folder")?;
+        Self::parse(resp, "folder/create").await
     }
 
     /// 删除一个 kb-file 文档（按 doc_key）。覆盖用：上传新 doc 后删旧 doc。

@@ -1,13 +1,14 @@
-//! 同步引擎：单文件 / 文件夹批量同步、覆盖（新 doc + 删旧 doc）、
-//! 本地删除策略（远端保留为备份）、>20 硬上限、单飞、重试、sha256 变更检测。
+//! 同步引擎：单文件 / 文件夹递归同步（远端按子目录结构镜像，find-or-create）、
+//! 覆盖（新 doc + 删旧 doc）、本地删除策略（远端保留为备份）、≤500 硬上限、
+//! 单飞、重试、sha256 变更检测、内置临时文件排除。
 
 use crate::db::{self, now_secs};
-use crate::emoo::EmooClient;
+use crate::emoo::{EmooClient, FolderItem};
 use crate::state::AppState;
 use crate::task::*;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,7 +101,7 @@ pub async fn sync_task(
     let mut outcome = SyncOutcome::default();
 
     if task.is_dir {
-        // 目录分支
+        // 目录分支（递归收集 + 远端子目录镜像）
         let files = match list_syncable_files(&root) {
             Some(f) => f,
             None => {
@@ -111,10 +112,10 @@ pub async fn sync_task(
             }
         };
 
-        // 硬上限
+        // 硬上限（含子目录）
         if files.len() > FOLDER_FILE_CAP {
             let msg = format!(
-                "文件夹内可同步文件 {} 个，超过 {} 上限，已中止（不部分同步）",
+                "文件夹内（含子目录）可同步文件 {} 个，超过 {} 上限，已中止（不部分同步）",
                 files.len(),
                 FOLDER_FILE_CAP
             );
@@ -123,13 +124,78 @@ pub async fn sync_task(
             bail!(msg);
         }
 
+        // 先解析全部唯一子目录（find-or-create 镜像）。放在上传前：
+        // 建不了文件夹（如非超管 key）时快速失败，不产生「半镜像」。
+        let mut resolver = FolderResolver::new(&client, task.target_folder_id);
+
+        // 包含文件夹本身：在目标下 find-or-create 与本地根同名的文件夹，整体镜像进它。
+        // （路径无文件名的极端情况跳过，退回直接镜像内容）
+        if task.include_root {
+            if let Some(root_name) = root.file_name().and_then(|n| n.to_str()) {
+                if let Err(e) = resolver.embed_root(app, state, task_id, root_name).await {
+                    let msg = e.to_string();
+                    set_status(app, state, task_id, STATUS_ERROR, &msg);
+                    emit_log(
+                        app,
+                        state,
+                        task_id,
+                        "error",
+                        "解析/创建远端文件夹失败，同步中止",
+                        &msg,
+                    );
+                    bail!(msg);
+                }
+            }
+        }
+        {
+            let mut dirs: Vec<&str> = files
+                .iter()
+                .map(|f| parent_rel(f))
+                .filter(|d| !d.is_empty())
+                .collect();
+            dirs.sort_unstable();
+            dirs.dedup();
+            for d in dirs {
+                if let Err(e) = resolver.resolve(app, state, task_id, d).await {
+                    let msg = e.to_string();
+                    set_status(app, state, task_id, STATUS_ERROR, &msg);
+                    emit_log(
+                        app,
+                        state,
+                        task_id,
+                        "error",
+                        "解析/创建远端文件夹失败，同步中止",
+                        &msg,
+                    );
+                    bail!(msg);
+                }
+            }
+        }
+
         let total = files.len() as u32;
         let on_disk: HashSet<String> = files.iter().cloned().collect();
 
-        for (i, name) in files.iter().enumerate() {
-            let abs = root.join(name);
-            emit_progress(app, task_id, (i + 1) as u32, total, name);
-            match sync_one_file(app, state, &client, task_id, task.target_folder_id, &abs, name, task.permission.as_ref())
+        for (i, rel) in files.iter().enumerate() {
+            let abs = root.join(rel);
+            emit_progress(app, task_id, (i + 1) as u32, total, rel);
+            // 该文件应落入的远端文件夹：根文件 = 任务目标；子目录文件 = 镜像出的子文件夹。
+            // 预解析后此处为缓存命中（零网络）；防御性处理 Err → 计入该文件失败。
+            let file_folder = match resolver.resolve(app, state, task_id, parent_rel(rel)).await {
+                Ok(id) => id,
+                Err(e) => {
+                    outcome.failed += 1;
+                    emit_log(
+                        app,
+                        state,
+                        task_id,
+                        "warn",
+                        &format!("解析远端文件夹失败：{rel}"),
+                        &e.to_string(),
+                    );
+                    continue;
+                }
+            };
+            match sync_one_file(app, state, &client, task_id, file_folder, &abs, rel, task.permission.as_ref())
                 .await
             {
                 Ok(FileAction::Created) => outcome.created += 1,
@@ -142,7 +208,7 @@ pub async fn sync_task(
                         state,
                         task_id,
                         "warn",
-                        &format!("同步失败：{name}"),
+                        &format!("同步失败：{rel}"),
                         &e.to_string(),
                     );
                 }
@@ -219,6 +285,137 @@ pub async fn sync_task(
         ),
     );
     Ok(outcome)
+}
+
+/// 在远端直接 children 里按名找 folder：先精确匹配，再大小写不敏感兜底
+/// （远端若用 ci 排序规则，避免建出仅大小写不同的重复文件夹）。
+fn find_folder_by_name<'a>(items: &'a [FolderItem], name: &str) -> Option<&'a FolderItem> {
+    let mut folders = items.iter().filter(|it| it.item_type == "folder");
+    folders
+        .clone()
+        .find(|it| it.name == name)
+        .or_else(|| folders.find(|it| it.name.eq_ignore_ascii_case(name)))
+}
+
+/// 本次同步运行的远端文件夹解析器：本地相对目录 → 远端 folder_id（子目录镜像）。
+/// find-or-create（无 DB 缓存，纯状态化 list-and-match，每轮同步重建）；
+/// 删除策略与文档一致：本地删目录后远端文件夹保留，重建同名目录会重新接上。
+struct FolderResolver<'a> {
+    client: &'a EmooClient,
+    /// 任务目标文件夹（None=远端根）。
+    root: Option<i64>,
+    /// 已解析子目录（相对目录路径 → folder id）。
+    cache: HashMap<String, i64>,
+}
+
+impl<'a> FolderResolver<'a> {
+    fn new(client: &'a EmooClient, root: Option<i64>) -> Self {
+        Self {
+            client,
+            root,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// include_root 模式：在任务目标下 find-or-create 与本地根同名的文件夹，
+    /// 并把解析根切到它 —— 之后所有子目录/根文件都镜像进这个文件夹。
+    async fn embed_root(
+        &mut self,
+        app: &AppHandle,
+        state: &Arc<AppState>,
+        task_id: i64,
+        name: &str,
+    ) -> Result<()> {
+        let parent = self.root; // 先拷值，避免接收者 &mut self 与参数读取的借用冲突
+        let id = self
+            .ensure_folder(app, state, task_id, name, name, parent)
+            .await?;
+        self.root = Some(id);
+        Ok(())
+    }
+
+    /// 解析 rel_dir（""=任务目标根，直接返回 root）。逐段解析祖先链；
+    /// 全部命中缓存则零网络请求。
+    async fn resolve(
+        &mut self,
+        app: &AppHandle,
+        state: &Arc<AppState>,
+        task_id: i64,
+        rel_dir: &str,
+    ) -> Result<Option<i64>> {
+        if rel_dir.is_empty() {
+            return Ok(self.root);
+        }
+        if let Some(id) = self.cache.get(rel_dir) {
+            return Ok(Some(*id));
+        }
+        let mut parent = self.root;
+        let mut prefix = String::new();
+        for seg in rel_dir.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(seg);
+            if let Some(id) = self.cache.get(&prefix) {
+                parent = Some(*id);
+                continue;
+            }
+            let id = self
+                .ensure_folder(app, state, task_id, &prefix, seg, parent)
+                .await?;
+            parent = Some(id);
+        }
+        Ok(parent)
+    }
+
+    /// find-or-create 单段。列 children（GET 幂等，带重试）→ 命中即复用；
+    /// 未命中 POST 新建（带重试）；创建失败再列一次兜底并发/远端已建（如 4206）。
+    async fn ensure_folder(
+        &mut self,
+        app: &AppHandle,
+        state: &Arc<AppState>,
+        task_id: i64,
+        prefix: &str,
+        name: &str,
+        parent: Option<i64>,
+    ) -> Result<i64> {
+        let client = self.client; // 先拷引用，避免闭包与 &mut self 的借用冲突
+        let items = with_retry(3, 500, || async { client.list_folder_items(parent).await })
+            .await
+            .map_err(|e| anyhow!("列出远端文件夹失败：{prefix}（父 folder_id={parent:?}）：{e}"))?;
+        if let Some(found) = find_folder_by_name(&items, name) {
+            self.cache.insert(prefix.to_string(), found.id);
+            return Ok(found.id);
+        }
+        match with_retry(3, 500, || async { client.create_folder(name, parent).await }).await {
+            Ok(info) => {
+                emit_log(
+                    app,
+                    state,
+                    task_id,
+                    "info",
+                    &format!("已创建远端文件夹：{prefix}"),
+                    &format!("folder_id={}", info.id),
+                );
+                self.cache.insert(prefix.to_string(), info.id);
+                Ok(info.id)
+            }
+            Err(e) => {
+                // 兜底：并发的另一任务/他人刚建了同名文件夹（业务错误 4206 等）→ 再列一次
+                let relist =
+                    with_retry(2, 500, || async { client.list_folder_items(parent).await }).await;
+                if let Ok(items2) = relist {
+                    if let Some(found) = find_folder_by_name(&items2, name) {
+                        self.cache.insert(prefix.to_string(), found.id);
+                        return Ok(found.id);
+                    }
+                }
+                Err(anyhow!(
+                    "创建远端文件夹失败：{prefix}（创建文件夹需工作区超管权限；远端文件夹树最深 10 层）：{e}"
+                ))
+            }
+        }
+    }
 }
 
 async fn sync_one_file(
@@ -406,30 +603,75 @@ async fn decide_action(
     Ok((action, Some(doc.doc_key)))
 }
 
-/// 某目录下的顶层白名单文件名（忽略子目录、隐藏文件、非白名单扩展），按名排序。
-/// 读不到目录返回 None。
+/// 内置临时/系统文件排除规则（仅内置，不开放用户配置）。扩展名白名单本身已排除
+/// 绝大多数临时文件，这里主要兜底「白名单扩展名的锁文件」（如 Office 的 ~$xx.docx）。
+const BUILTIN_TEMP_PREFIXES: &[&str] = &["~$"];
+const BUILTIN_TEMP_NAMES: &[&str] = &["thumbs.db", "desktop.ini"];
+const BUILTIN_TEMP_EXTS: &[&str] = &["tmp", "temp", "part", "crdownload", "download"];
+
+/// 是否命中内置排除规则（大小写不敏感：Thumbs.db 来自 Windows，macOS 上大小写不定）。
+fn is_builtin_temp_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    BUILTIN_TEMP_NAMES.contains(&lower.as_str())
+        || BUILTIN_TEMP_PREFIXES.iter().any(|p| lower.starts_with(p))
+        || BUILTIN_TEMP_EXTS.contains(&lower.rsplit('.').next().unwrap_or(""))
+}
+
+/// 递归收集 root 下全部白名单文件（剪隐藏目录、跳隐藏/内置临时文件/非白名单扩展）。
+/// 返回以 '/' 连接的相对路径（根级文件为裸文件名，兼容历史记录），按路径排序。
+/// 根目录读不到返回 None；子目录读不动（权限等）仅跳过该子树。
 pub fn list_syncable_files(root: &Path) -> Option<Vec<String>> {
-    let rd = std::fs::read_dir(root).ok()?;
-    let mut names: Vec<String> = rd
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if !p.is_file() {
-                return None;
-            }
-            let name = p.file_name()?.to_str()?.to_string();
+    let mut out = Vec::new();
+    walk_dir(root, "", &mut out)?;
+    out.sort();
+    Some(out)
+}
+
+/// 单层收集。dir_rel 为当前目录相对路径（""=根）。
+fn walk_dir(dir: &Path, dir_rel: &str, out: &mut Vec<String>) -> Option<()> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // 目录判定用 entry.file_type()（不跟随符号链接 → 不会绕回成环）
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             if name.starts_with('.') {
-                return None;
+                continue; // 隐藏目录整棵剪掉
             }
-            let (allowed, _, _) = crate::emoo::ext_info(&name);
+            let child_rel = join_rel(dir_rel, name);
+            let _ = walk_dir(&path, &child_rel, out); // 子目录失败仅跳过该子树
+        } else if path.is_file() {
+            // 文件判定跟随符号链接，与旧实现一致（链接到普通文件可同步）
+            if name.starts_with('.') || is_builtin_temp_file(name) {
+                continue;
+            }
+            let (allowed, _, _) = crate::emoo::ext_info(name);
             if !allowed {
-                return None;
+                continue;
             }
-            Some(name)
-        })
-        .collect();
-    names.sort();
-    Some(names)
+            out.push(join_rel(dir_rel, name));
+        }
+    }
+    Some(())
+}
+
+/// 相对路径拼接（恒用 '/'，不依赖平台分隔符；root.join(rel) 在 Windows 也接受 '/'）。
+fn join_rel(dir_rel: &str, name: &str) -> String {
+    if dir_rel.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir_rel}/{name}")
+    }
+}
+
+/// 相对路径的目录部分："子目录/嵌套/f.pdf" → "子目录/嵌套"；根级文件 → ""。
+fn parent_rel(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -537,5 +779,121 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn builtin_temp_rules() {
+        // 命中：Office 锁文件（白名单扩展也拦）、系统文件、临时扩展（大小写不敏感）
+        for n in [
+            "~$report.docx",
+            "~$",
+            "Thumbs.db",
+            "thumbs.db",
+            "desktop.ini",
+            "a.tmp",
+            "b.TEMP",
+            "c.part",
+            "d.crdownload",
+        ] {
+            assert!(is_builtin_temp_file(n), "应命中排除规则：{n}");
+        }
+        // 不命中：正常白名单文件
+        for n in ["report.pdf", "data.csv", "笔记.md", "Thumbs.dbx", "照片.JPG"] {
+            assert!(!is_builtin_temp_file(n), "不应命中排除规则：{n}");
+        }
+    }
+
+    #[test]
+    fn parent_rel_cases() {
+        assert_eq!(parent_rel("a/b/f.pdf"), "a/b");
+        assert_eq!(parent_rel("f.pdf"), "");
+        assert_eq!(parent_rel("a/b/c"), "a/b");
+    }
+
+    fn folder(id: i64, name: &str) -> FolderItem {
+        FolderItem {
+            item_type: "folder".to_string(),
+            id,
+            name: name.to_string(),
+            parent_id: None,
+            folder_id: None,
+            has_children: None,
+        }
+    }
+
+    #[test]
+    fn find_folder_by_name_cases() {
+        let items = vec![
+            folder(1, "报告"),
+            FolderItem {
+                item_type: "document".to_string(),
+                id: 2,
+                name: "报告".to_string(), // 非文件夹项，应被忽略
+                parent_id: None,
+                folder_id: Some(9),
+                has_children: None,
+            },
+            folder(3, "Photos"),
+        ];
+        // 精确命中
+        assert_eq!(find_folder_by_name(&items, "报告").map(|f| f.id), Some(1));
+        // 大小写不敏感兜底
+        assert_eq!(find_folder_by_name(&items, "photos").map(|f| f.id), Some(3));
+        // 未命中
+        assert!(find_folder_by_name(&items, "不存在").is_none());
+    }
+
+    #[test]
+    fn list_syncable_files_recursive() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        let sub = p.join("子目录");
+        let nested = sub.join("嵌套");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        for (dir, name) in [
+            (p.to_path_buf(), "a.md"),
+            (p.to_path_buf(), "b.jpg"),
+            (p.to_path_buf(), "c.exe"),        // 非白名单扩展
+            (p.to_path_buf(), "~$x.docx"),     // Office 锁文件
+            (p.to_path_buf(), "Thumbs.db"),    // 系统文件
+            (p.to_path_buf(), ".hidden.txt"),  // 隐藏文件
+            (p.to_path_buf(), "x.tmp"),        // 临时扩展
+            (sub.clone(), "n.pdf"),
+            (sub.clone(), ".DS_Store"),
+            (nested.clone(), "d.docx"),
+            (nested.clone(), "~$lock.docx"),
+            (p.join(".git"), "x.pdf"), // 隐藏目录整棵剪掉
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let got = list_syncable_files(p).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "a.md".to_string(),
+                "b.jpg".to_string(),
+                "子目录/n.pdf".to_string(),
+                "子目录/嵌套/d.docx".to_string(),
+            ]
+        );
+
+        // 根不存在 → None
+        assert!(list_syncable_files(Path::new("/nonexistent/zzz")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_syncable_files_skips_dir_symlink() {
+        // 目录符号链接不跟随（防成环）：root/loop -> root，walk 必须终止且不含 loop 下内容
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        std::fs::create_dir_all(p.join("real")).unwrap();
+        std::fs::write(p.join("real/a.md"), b"x").unwrap();
+        std::os::unix::fs::symlink(p, p.join("loop")).unwrap();
+
+        let got = list_syncable_files(p).unwrap();
+        assert_eq!(got, vec!["real/a.md".to_string()]);
     }
 }
