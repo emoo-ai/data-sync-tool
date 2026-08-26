@@ -3,7 +3,6 @@ import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { open, ask, message } from "@tauri-apps/plugin-dialog";
-import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const baseUrl = ref("https://app.emooai.com/open-api/v1");
@@ -606,10 +605,11 @@ function scheduleFit(center: boolean) {
   }, 40);
 }
 
-// 开机自启：读取系统真实状态；切换时调用插件写入 launchd( macOS ) / 注册表( Windows )。
+// 开机自启：读取系统真实状态；切换时经后端写入 launchd(macOS) / 注册表(Windows，
+// 被管控拒绝时自动兜底为启动文件夹快捷方式)。
 async function loadAutostart() {
   try {
-    autostartOn.value = await isEnabled();
+    autostartOn.value = await invoke<boolean>("autostart_is_enabled");
   } catch {
     /* 非 Tauri 环境忽略 */
   }
@@ -617,8 +617,8 @@ async function loadAutostart() {
 async function toggleAutostart(e: Event) {
   const checked = (e.target as HTMLInputElement).checked;
   try {
-    if (checked) await enable();
-    else await disable();
+    if (checked) await invoke("autostart_enable");
+    else await invoke("autostart_disable");
     autostartOn.value = checked;
   } catch (err) {
     autostartOn.value = !checked; // 复选框回滚

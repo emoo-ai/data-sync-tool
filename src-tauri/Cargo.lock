@@ -3830,6 +3830,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "tokio",
+ "windows",
 ]
 
 [[package]]

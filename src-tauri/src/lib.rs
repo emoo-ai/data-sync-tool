@@ -3,6 +3,7 @@
 //! 全局状态经 `.manage(Arc<AppState>)` 注入；命令通过 `tauri::State<'_, Arc<AppState>>` 取用。
 //! 安全约束：只调 Emoo Open API；`emooSearch` 原生代码仅供理解。
 
+mod autostart;
 mod config;
 mod db;
 mod emoo;
@@ -339,6 +340,10 @@ pub fn run() {
             // 托盘偏好
             set_close_behavior,
             set_emoo_user_id,
+            // 开机自启（带 Windows 启动文件夹兜底）
+            autostart::autostart_enable,
+            autostart::autostart_disable,
+            autostart::autostart_is_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")

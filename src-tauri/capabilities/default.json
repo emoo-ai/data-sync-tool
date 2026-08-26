@@ -9,7 +9,6 @@
     "core:window:allow-center",
     "opener:default",
     "dialog:default",
-    "dialog:allow-ask",
-    "autostart:default"
+    "dialog:allow-ask"
   ]
 }
