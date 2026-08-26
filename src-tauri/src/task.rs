@@ -13,7 +13,7 @@ pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_ERROR: &str = "error";
 
 /// 文件夹任务的递归白名单文件硬上限（含子目录；超出 → 报错，绝不部分同步）。
-pub const FOLDER_FILE_CAP: usize = 500;
+pub const FOLDER_FILE_CAP: usize = 5000;
 
 /// 同步调度间隔下限（秒）= 1 小时。
 /// UI 以「小时」为单位输入（最低 1），后端换算成秒存储，调度器仍按秒工作。

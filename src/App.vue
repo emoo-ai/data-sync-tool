@@ -86,7 +86,7 @@ interface TaskPatch {
 }
 
 /// 文件夹任务递归文件数上限（含子目录），与后端 task.rs 的 FOLDER_FILE_CAP 保持一致。
-const FOLDER_FILE_CAP = 500;
+const FOLDER_FILE_CAP = 5000;
 
 // ---------- 文件夹树（新建任务表单内复用） ----------
 const rootChildren = ref<FolderNode[]>([]);
