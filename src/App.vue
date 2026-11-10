@@ -80,6 +80,7 @@ interface WsUser {
 }
 interface TaskPatch {
   name?: string;
+  localPath?: string;
   scheduleEnabled?: boolean;
   scheduleIntervalSecs?: number;
 }
@@ -375,6 +376,79 @@ async function removeTask(t: Task) {
     await refreshTasks();
   } catch (e) {
     await message("删除失败：" + errMsg(e), { title: "删除失败", kind: "error" });
+  }
+}
+
+// ---------- 修改本地路径 ----------
+// 换路径后 file_records 保留：内容相同的文件按 hash 自动关联旧文档（不重复上传）；
+// 旧路径独有、新路径没有的文件由下次同步标「本地已删除，远端文档保留」。
+const editOpen = ref(false);
+const editTask = ref<Task | null>(null);
+const editPath = ref("");
+const editCount = ref<number | null>(null);
+const editError = ref("");
+const editSaving = ref(false);
+
+function openEdit(t: Task) {
+  editTask.value = t;
+  editPath.value = t.localPath;
+  editCount.value = null;
+  editError.value = "";
+  editOpen.value = true;
+  if (t.isDir) void checkEditCap();
+}
+
+async function checkEditCap() {
+  const t = editTask.value;
+  if (!t?.isDir || !editPath.value) {
+    editCount.value = null;
+    return;
+  }
+  try {
+    const n = await invoke<number | null>("count_folder_files", { path: editPath.value });
+    editCount.value = n;
+    editError.value =
+      n != null && n > FOLDER_FILE_CAP
+        ? `文件夹内可同步 ${n} 个文件（含子目录），超过 ${FOLDER_FILE_CAP} 个上限，请精简或改选`
+        : "";
+  } catch {
+    editCount.value = null;
+  }
+}
+
+async function pickEditPath() {
+  const t = editTask.value;
+  if (!t) return;
+  // 类型锁定：文件夹任务只能换文件夹，文件任务只能换文件（后端同样校验）
+  const sel = await open({ directory: t.isDir, multiple: false });
+  if (typeof sel === "string") {
+    editPath.value = sel;
+    if (t.isDir) await checkEditCap();
+    else editError.value = "";
+  }
+}
+
+async function saveEdit() {
+  const t = editTask.value;
+  if (!t) return;
+  if (!editPath.value) {
+    editError.value = "请选择新的本地路径";
+    return;
+  }
+  if (editPath.value === t.localPath) {
+    editOpen.value = false; // 没变，直接关
+    return;
+  }
+  if (editError.value) return;
+  editSaving.value = true;
+  try {
+    const updated = await invoke<Task>("update_task", { id: t.id, patch: { localPath: editPath.value } });
+    Object.assign(t, updated);
+    editOpen.value = false;
+  } catch (e) {
+    editError.value = "保存失败：" + errMsg(e);
+  } finally {
+    editSaving.value = false;
   }
 }
 
@@ -1013,6 +1087,12 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
 
           <div class="paths">
             <span class="muted">本地：</span><span class="mono">{{ t.localPath }}</span>
+            <button
+              class="sm link path-edit"
+              :disabled="t.status === 'syncing'"
+              title="更换此任务同步的本地文件/文件夹"
+              @click="openEdit(t)"
+            >修改</button>
             <span class="muted arr">→</span>
             <span class="muted">Emoo：</span><span class="mono">{{ targetLabel(t) }}</span>
           </div>
@@ -1106,6 +1186,50 @@ function audienceLabel(a: PermissionAudience | undefined | null): string {
         </div>
       </section>
     </template>
+
+    <!-- 修改本地路径弹窗 -->
+    <div v-if="editOpen" class="overlay" @click.self="editOpen = false">
+      <div class="modal">
+        <div class="modal-hd">
+          <span>修改本地路径{{ editTask ? " — " + editTask.name : "" }}</span>
+          <button class="link sm" @click="editOpen = false">✕</button>
+        </div>
+        <div class="modal-bd">
+          <p class="muted small edit-hint">
+            更换后：内容相同的文件会自动关联已同步文档，不会重复上传；旧路径下已同步、
+            新路径中不存在的文件，下次同步时标记为「本地已删除，远端文档保留」。
+          </p>
+          <div class="field">
+            <span class="lab">当前路径</span>
+            <span class="mono cur-path">{{ editTask?.localPath }}</span>
+          </div>
+          <div class="field">
+            <span class="lab">新路径（{{ editTask?.isDir ? "文件夹" : "单个文件" }}）</span>
+            <div class="row-input">
+              <button class="sm" @click="pickEditPath">
+                选择{{ editTask?.isDir ? "文件夹" : "文件" }}
+              </button>
+              <span class="path" :class="{ empty: !editPath }">{{ editPath || "未选择" }}</span>
+              <span v-if="editTask?.isDir && editCount != null" class="cap">
+                可同步 {{ editCount }} 个文件（含子目录）
+              </span>
+            </div>
+          </div>
+          <p v-if="editError" class="msg err">{{ editError }}</p>
+        </div>
+        <div class="modal-ft">
+          <button class="sm" @click="editOpen = false">取消</button>
+          <button
+            class="primary sm"
+            :disabled="editSaving || !!editError || !editPath"
+            @click="saveEdit"
+          >
+            <span v-if="editSaving" class="spinner sm"></span>
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
 
     <!-- 权限编辑弹窗 -->
     <div v-if="permOpen" class="overlay" @click.self="permOpen = false">
@@ -1605,6 +1729,18 @@ button.danger:hover:not(:disabled) {
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
+}
+.path-edit {
+  padding: 2px 6px;
+  font-size: 11px;
+  flex: none;
+}
+.edit-hint {
+  margin: 0;
+  line-height: 1.6;
+}
+.cur-path {
+  word-break: break-all;
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

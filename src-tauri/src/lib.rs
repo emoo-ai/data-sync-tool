@@ -122,6 +122,43 @@ fn update_task(
     id: i64,
     patch: TaskPatch,
 ) -> Result<Task, String> {
+    // 改本地路径：同步中拒绝；校验存在性、类型匹配（文件夹任务只能换文件夹，
+    // 文件任务只能换文件）、文件夹文件数上限（与 create_task 同一套兜底）。
+    if let Some(new_path) = patch.local_path.as_deref() {
+        {
+            let g = state.inflight.lock();
+            if g.contains(&id) {
+                return Err("任务正在同步，请稍后再试".to_string());
+            }
+        }
+        let task = {
+            let g = state.db.lock();
+            db::get_task(&g, id).map_err(|e| e.to_string())?
+        }
+        .ok_or_else(|| "任务不存在".to_string())?;
+        let p = std::path::Path::new(new_path);
+        if !p.exists() {
+            return Err(format!("路径不存在：{new_path}"));
+        }
+        if p.is_dir() != task.is_dir {
+            return Err(format!(
+                "路径类型不匹配：该任务同步的是{}，请重新选择{}",
+                if task.is_dir { "文件夹" } else { "单个文件" },
+                if task.is_dir { "文件夹" } else { "文件" },
+            ));
+        }
+        if task.is_dir {
+            let files = sync_engine::list_syncable_files(p)
+                .ok_or_else(|| format!("读取目录失败：{new_path}"))?;
+            if files.len() > task::FOLDER_FILE_CAP {
+                return Err(format!(
+                    "文件夹内（含子目录）可同步文件 {} 个，超过 {} 上限",
+                    files.len(),
+                    task::FOLDER_FILE_CAP
+                ));
+            }
+        }
+    }
     let g = state.db.lock();
     db::update_task(&g, id, &patch).map_err(|e| e.to_string())
 }

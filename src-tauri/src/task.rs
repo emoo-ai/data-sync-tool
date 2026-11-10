@@ -75,11 +75,13 @@ impl NewTask {
     }
 }
 
-/// 局部更新（缺省字段 = 不动）。M2 不支持改 target_folder_id，要换目标请删后重建。
+/// 局部更新（缺省字段 = 不动）。支持改本地路径（update_task 命令层校验存在性/
+/// 类型匹配/文件夹上限）；仍不支持改 target_folder_id，要换目标请删后重建。
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPatch {
     pub name: Option<String>,
+    pub local_path: Option<String>,
     pub schedule_enabled: Option<bool>,
     pub schedule_interval_secs: Option<i64>,
 }

@@ -209,6 +209,36 @@ pub fn update_task(conn: &Connection, id: i64, p: &TaskPatch) -> Result<Task> {
             params![name, now, id],
         )?;
     }
+    if let Some(new_path) = &p.local_path {
+        // 旧值留作日志；file_records 不清空 —— 内容相同的文件按 hash 自动关联旧文档，
+        // 旧路径独有、新路径没有的记录由下次同步的删除扫描标 source_deleted（远端保留）。
+        let old: Option<String> = conn
+            .query_row(
+                "SELECT local_path FROM tasks WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .ok();
+        conn.execute(
+            "UPDATE tasks SET local_path=?1, updated_at=?2 WHERE id=?3",
+            params![new_path, now, id],
+        )?;
+        if old.as_deref() != Some(new_path.as_str()) {
+            // 路径真的变了：因路径问题暂停/出错的恢复为就绪，等下次同步
+            conn.execute(
+                "UPDATE tasks SET status='idle', status_message='' \
+                 WHERE id=?1 AND status IN ('paused','error')",
+                params![id],
+            )?;
+            append_log(
+                conn,
+                id,
+                "info",
+                "本地路径已修改",
+                &format!("{} → {}", old.as_deref().unwrap_or("?"), new_path),
+            )?;
+        }
+    }
     if let Some(s) = p.schedule_enabled {
         conn.execute(
             "UPDATE tasks SET schedule_enabled=?1, updated_at=?2 WHERE id=?3",
@@ -466,6 +496,97 @@ mod tests {
         touch_task_synced(&c, t.id, now_secs()).unwrap();
         let due2 = list_schedule_due(&c, now_secs()).unwrap();
         assert!(!due2.iter().any(|x| x.id == t.id)); // 刚同步未到期
+    }
+
+    #[test]
+    fn update_task_path_change_resets_paused_and_logs() {
+        let c = mem();
+        let t = insert_task(&c, &sample_new("a", "/old/path", true)).unwrap();
+        set_task_status(&c, t.id, STATUS_PAUSED, Some("源路径找不到了")).unwrap();
+
+        let patch = TaskPatch {
+            local_path: Some("/new/path".into()),
+            ..Default::default()
+        };
+        let updated = update_task(&c, t.id, &patch).unwrap();
+        assert_eq!(updated.local_path, "/new/path");
+        // 因路径问题的暂停随路径修复清空，等下次同步
+        assert_eq!(updated.status, STATUS_IDLE);
+        assert_eq!(updated.status_message, "");
+        // 留下 old → new 审计日志
+        let logs = recent_log(&c, Some(t.id), 10).unwrap();
+        assert_eq!(
+            logs.iter()
+                .filter(|l| l.message == "本地路径已修改" && l.detail.contains("/old/path → /new/path"))
+                .count(),
+            1
+        );
+
+        // 同路径重复提交 ≠ 变更：不重复写日志，也不误清其它错误状态
+        set_task_status(&c, t.id, STATUS_ERROR, Some("别的错误")).unwrap();
+        update_task(&c, t.id, &patch).unwrap();
+        let logs2 = recent_log(&c, Some(t.id), 10).unwrap();
+        assert_eq!(
+            logs2.iter().filter(|l| l.message == "本地路径已修改").count(),
+            1
+        );
+        let t2 = get_task(&c, t.id).unwrap().unwrap();
+        assert_eq!(t2.status, STATUS_ERROR);
+        assert_eq!(t2.status_message, "别的错误");
+    }
+
+    #[test]
+    fn update_task_path_change_keeps_permission_and_records() {
+        let c = mem();
+        let t = insert_task(&c, &sample_new("a", "/old/dir", true)).unwrap();
+        // 任务启用权限 + 一条已同步文件记录
+        let perm = PermissionSetting {
+            visible: crate::emoo::DocPermissionAudience {
+                perm_type: "specified".into(),
+                user_open_ids: vec!["ou_1".into()],
+                group_ids: vec![],
+            },
+            deletable: crate::emoo::DocPermissionAudience {
+                perm_type: "none".into(),
+                user_open_ids: vec![],
+                group_ids: vec![],
+            },
+        };
+        set_task_permission(&c, t.id, &Some(perm)).unwrap();
+        upsert_file_record(
+            &c,
+            &FileRecord {
+                task_id: t.id,
+                relative_path: "a.md".into(),
+                doc_key: "k1".into(),
+                content_hash: "h1".into(),
+                size: 1,
+                mtime: 1,
+                synced_at: 1,
+                status: "synced".into(),
+            },
+        )
+        .unwrap();
+
+        update_task(
+            &c,
+            t.id,
+            &TaskPatch {
+                local_path: Some("/new/dir".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 权限设置与文件记录都保留（记录用于换路径后按 hash 重新关联旧文档）
+        let t2 = get_task(&c, t.id).unwrap().unwrap();
+        let p = t2.permission.expect("权限应保留");
+        assert_eq!(p.visible.perm_type, "specified");
+        assert_eq!(p.visible.user_open_ids, vec!["ou_1".to_string()]);
+        assert_eq!(p.deletable.perm_type, "none");
+        let recs = list_file_records(&c, t.id).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].doc_key, "k1");
     }
 
     #[test]
