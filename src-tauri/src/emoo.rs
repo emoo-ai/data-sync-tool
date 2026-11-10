@@ -190,8 +190,8 @@ impl EmooClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            base: base.trim_end_matches('/').to_string(),
-            api_key,
+            base: base.trim().trim_end_matches('/').to_string(),
+            api_key: api_key.trim().to_string(),
             emoo_user_id: emoo_user_id.filter(|s| !s.trim().is_empty()),
             http,
         }
@@ -204,8 +204,8 @@ impl EmooClient {
         api_key: String,
         emoo_user_id: Option<String>,
     ) {
-        self.base = base.trim_end_matches('/').to_string();
-        self.api_key = api_key;
+        self.base = base.trim().trim_end_matches('/').to_string();
+        self.api_key = api_key.trim().to_string();
         self.emoo_user_id = emoo_user_id.filter(|s| !s.trim().is_empty());
     }
 

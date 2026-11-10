@@ -70,8 +70,8 @@ pub fn save(
 ) -> Result<()> {
     let mut c = load(app).unwrap_or_default();
     let uid = emoo_user_id.filter(|s| !s.trim().is_empty());
-    c.base_url = base_url;
-    c.api_key = api_key;
+    c.base_url = base_url.trim().trim_end_matches('/').to_string();
+    c.api_key = api_key.trim().to_string();
     c.emoo_user_id = uid;
     write(app, &c)
 }
